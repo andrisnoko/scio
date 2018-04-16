@@ -269,7 +269,7 @@ package object bigtable {
      * creation of bulk writes to Bigtable. Note that elements must be of type `Mutation`.
      */
     def saveAsBigtable(tableId: String,
-                       numOfShards: Int = 0,
+                       numOfShards: Int = 1,
                        bigtableOptions: BigtableOptions,
                        flushInterval: Duration = Duration.standardSeconds(1))
                       (implicit ev: T <:< Mutation)

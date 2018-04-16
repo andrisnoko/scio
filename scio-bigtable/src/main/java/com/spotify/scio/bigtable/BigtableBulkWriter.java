@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Spotify AB.
+ * Copyright 2018 Spotify AB.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ package com.spotify.scio.bigtable;
 
 import com.google.bigtable.v2.Mutation;
 import com.google.cloud.bigtable.config.BigtableOptions;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
-import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
@@ -53,19 +53,28 @@ public class BigtableBulkWriter extends
   private final int numOfShards;
   private final Duration flushInterval;
 
-  public BigtableBulkWriter(String tableName,
-                            BigtableOptions bigtableOptions,
-                            int numOfShards,
-                            Duration flushInterval){
-   this.bigtableOptions = bigtableOptions;
-   this.tableName = tableName;
-   this.numOfShards = numOfShards;
-   this.flushInterval = flushInterval;
+  public BigtableBulkWriter(final String tableName,
+                            final BigtableOptions bigtableOptions,
+                            final int numOfShards,
+                            final Duration flushInterval) {
+    this.bigtableOptions = bigtableOptions;
+    this.tableName = tableName;
+    this.numOfShards = numOfShards;
+    this.flushInterval = flushInterval;
   }
 
   @Override
   public PDone expand(PCollection<KV<ByteString, Iterable<Mutation>>> input) {
-   input
+    createBulkShards(input, numOfShards, flushInterval)
+        .apply("Bigtable BulkWrite", ParDo.of(new BigtableBulkWriterFn()));
+    return PDone.in(input.getPipeline());
+  }
+
+  @VisibleForTesting
+  static PCollection<Iterable<KV<ByteString, Iterable<Mutation>>>> createBulkShards(
+      final PCollection<KV<ByteString, Iterable<Mutation>>> input, final int numOfShards,
+      final Duration flushInterval) {
+    return input
         .apply("Assign To Shard", ParDo.of(new AssignToShard(numOfShards)))
         .apply("Window", Window
             .<KV<Long, KV<ByteString, Iterable<Mutation>>>>into(new GlobalWindows())
@@ -73,7 +82,8 @@ public class BigtableBulkWriter extends
                 AfterProcessingTime
                     .pastFirstElementInPane()
                     .plusDelayOf(flushInterval)))
-            .discardingFiredPanes())
+            .discardingFiredPanes()
+            .withAllowedLateness(Duration.ZERO))
         .apply("Group By Shard", GroupByKey.create())
         .apply("Gets Mutations", ParDo
             .of(new DoFn<KV<Long, Iterable<KV<ByteString, Iterable<Mutation>>>>,
@@ -82,10 +92,9 @@ public class BigtableBulkWriter extends
               public void process(ProcessContext c) {
                 c.output(c.element().getValue());
               }
-            }))
-        .apply("Bigtable BulkWrite", ParDo.of(new BigtableBulkWriterFn()));
-    return PDone.in(input.getPipeline());
+            }));
   }
+
 
   private class BigtableBulkWriterFn extends
                                      DoFn<Iterable<KV<ByteString, Iterable<Mutation>>>, Void> {
@@ -95,7 +104,7 @@ public class BigtableBulkWriter extends
     private final ConcurrentLinkedQueue<BigtableWriteException> failures;
 
     public BigtableBulkWriterFn() {
-     this.failures = new ConcurrentLinkedQueue<>();
+      this.failures = new ConcurrentLinkedQueue<>();
     }
 
     @StartBundle
@@ -110,17 +119,13 @@ public class BigtableBulkWriter extends
     @ProcessElement
     public void processElement(ProcessContext c) throws Exception {
       checkForFailures(failures);
-      final Iterable<KV<ByteString, Iterable<Mutation>>> elements = c.element();
-      final Iterator<KV<ByteString, Iterable<Mutation>>> iterator = elements.iterator();
-
-      while (iterator.hasNext()) {
-        final KV<ByteString, Iterable<Mutation>> value = iterator.next();
+      for (KV<ByteString, Iterable<Mutation>> r : c.element()) {
         bigtableWriter
-            .writeRecord(value)
+            .writeRecord(r)
             .whenComplete(
                 (mutationResult, exception) -> {
                   if (exception != null) {
-                    failures.add(new BigtableWriteException(value, exception));
+                    failures.add(new BigtableWriteException(r, exception));
                   }
                 });
         ++recordsWritten;
